@@ -38,7 +38,7 @@ mod test {
                 NonNativeFieldVar::<bls12_fq, F>::new_constant(cs.clone(), self.g1_generator.y)?;
 
             let mut g1_generator_var = G1Var::new(g1_x, g1_y);
-            g1_generator_var = g1_generator_var.mul(&scalar_var)?;
+            g1_generator_var.mul(&scalar_var)?;
 
             println!(
                 "x values equal: {:?}",

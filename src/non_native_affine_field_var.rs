@@ -1,5 +1,7 @@
 #![allow(unused)] // TODO remove when used in release code
 
+use std::ops::BitAnd;
+
 use ark_bls12_381::g1::Config;
 use ark_ec::short_weierstrass::SWCurveConfig;
 use ark_ff::{Field, PrimeField};
@@ -55,31 +57,46 @@ where
         self.z.is_zero()
     }
 
-    pub fn mul(&self, scalar_var: &FpVar<F>) -> Result<Self, SynthesisError> {
+    pub fn mul(&mut self, scalar_var: &FpVar<F>) -> Result<(), SynthesisError> {
         let bits = scalar_var.to_bits_le()?;
+        self.mul_internal(bits.iter().rev())
+    }
+
+    fn mul_internal<'a>(
+        &mut self,
+        bits_le_rev: impl Iterator<Item = &'a Boolean<F>>,
+    ) -> Result<(), SynthesisError> {
         let mut res = Self::zero();
         let temp = Self::new_inner(self.x.clone(), self.y.clone(), self.z.clone());
 
-        let mut first_positive_bit = false;
-        for bit in bits.iter().rev() {
-            if first_positive_bit {
-                res.double_in_place()?;
-            }
+        let mut first_positive_bit: Boolean<F> = Boolean::constant(false);
+        for bit in bits_le_rev {
+            res.double_in_place()?;
+            res = first_positive_bit.select(&res, &Self::zero())?;
 
-            if let Ok(true) = bit.value() {
-                res.add_assign(temp.clone())?;
-                first_positive_bit = true;
-            }
+            first_positive_bit = first_positive_bit.or(bit)?;
+            let mut res_clone = res.clone();
+            res_clone.add_assign(temp.clone())?;
+
+            res = bit.select(&res_clone, &res)?;
         }
 
-        Ok(res)
+        self.x = res.x;
+        self.y = res.y;
+        self.z = res.z;
+        Ok(())
     }
 
     fn double_in_place(&mut self) -> Result<(), SynthesisError> {
-        if let Ok(true) = self.is_zero()?.value() {
-            return Ok(());
-        }
+        let mut self_clone_doubled = self.clone();
+        self_clone_doubled.double_in_place_non_zero()?;
 
+        *self = self.is_zero()?.select(self, &self_clone_doubled)?;
+
+        Ok(())
+    }
+
+    fn double_in_place_non_zero(&mut self) -> Result<(), SynthesisError> {
         // A = X1^2
         let mut a = self.x.clone();
         a.square_in_place()?;
@@ -100,12 +117,13 @@ where
             d *= &b;
             d.double()?.double()?
         } else {
-            let mut d = self.x.clone();
-            d += &b;
-            d.square_in_place()?;
-            d -= a.clone();
-            d -= c.clone();
-            d.double()?
+            unreachable!("This part of the code should not be reachable for extension degrees other than 1 or 2.");
+            // let mut d = self.x.clone();
+            // d += &b;
+            // d.square_in_place()?;
+            // d -= a.clone();
+            // d -= c.clone();
+            // d.double()?
         };
 
         // E = 3*A
@@ -139,13 +157,22 @@ where
 
     /// Using http://www.hyperelliptic.org/EFD/g1p/auto-shortw-jacobian-0.html#addition-madd-2007-bl
     fn add_assign(&mut self, other: Self) -> Result<(), SynthesisError> {
-        if let Ok(true) = self.is_zero()?.value() {
-            self.x = other.x.clone();
-            self.y = other.y.clone();
-            self.z = NonNativeFieldVar::one();
-            return Ok(());
-        }
+        let other_clone_for_self_zero = Self {
+            x: other.x.clone(),
+            y: other.y.clone(),
+            z: NonNativeFieldVar::one(),
+        };
 
+        let mut self_clone = self.clone();
+        self_clone.add_non_zero(other);
+
+        *self = self
+            .is_zero()?
+            .select(&other_clone_for_self_zero, &self_clone)?;
+        Ok(())
+    }
+
+    fn add_non_zero(&mut self, other: Self) -> Result<(), SynthesisError> {
         // Z1Z1 = Z1^2
         let mut z1z1 = self.z.clone();
         z1z1.square_in_place()?;
@@ -159,54 +186,64 @@ where
         s2 *= &other.y;
         s2 *= &z1z1;
 
-        if self.x == u2 && self.y == s2 {
-            // The two points are equal, so we double.
-            self.double_in_place()?;
-        } else {
-            // If we're adding -a and a together, self.z becomes zero as H becomes zero.
+        let equal_points = self.x.is_eq(&u2)?.and(&self.y.is_eq(&s2)?)?;
+        let mut self_clone_doubled = self.clone();
+        self_clone_doubled.double_in_place()?;
+        self.add_different_points(u2, s2);
 
-            // H = U2-X1
-            let mut h = u2;
-            h -= &self.x;
+        *self = equal_points.select(&self_clone_doubled, &self)?;
 
-            // HH = H^2
-            let mut hh = h.clone();
-            hh.square_in_place()?;
+        Ok(())
+    }
 
-            // I = 4*HH
-            let mut i = hh;
-            i = i.double()?.double()?;
+    fn add_different_points(
+        &mut self,
+        u2: NonNativeFieldVar<P::BaseField, F>,
+        s2: NonNativeFieldVar<P::BaseField, F>,
+    ) -> Result<(), SynthesisError> {
+        // If we're adding -a and a together, self.z becomes zero as H becomes zero.
 
-            // J = -H*I
-            let mut j = h.clone();
-            j.negate_in_place()?;
-            j *= &i;
+        // H = U2-X1
+        let mut h = u2;
+        h -= &self.x;
 
-            // r = 2*(S2-Y1)
-            let mut r = s2;
-            r -= &self.y;
-            r = r.double()?; // TODO replace with double_in_place after release of ark-ff > "0.4.2"
+        // HH = H^2
+        let mut hh = h.clone();
+        hh.square_in_place()?;
 
-            // V = X1*I
-            let mut v = self.x.clone();
-            v *= &i;
+        // I = 4*HH
+        let mut i = hh;
+        i = i.double()?.double()?;
 
-            // X3 = r^2 + J - 2*V
-            self.x = r.square()?;
-            self.x += &j;
-            self.x -= &v.double()?;
+        // J = -H*I
+        let mut j = h.clone();
+        j.negate_in_place()?;
+        j *= &i;
 
-            // Y3 = r*(V-X3) + 2*Y1*J
-            v -= &self.x;
+        // r = 2*(S2-Y1)
+        let mut r = s2;
+        r -= &self.y;
+        r = r.double()?; // TODO replace with double_in_place after release of ark-ff > "0.4.2"
 
-            self.y = self.y.double()?; // TODO replace with double_in_place after release of ark-ff > "0.4.2"
-            self.y = sum_of_products::<P, F, 2>(&[r, self.y.clone()], &[v, j]);
+        // V = X1*I
+        let mut v = self.x.clone();
+        v *= &i;
 
-            // Z3 = 2 * Z1 * H;
-            // Can alternatively be computed as (Z1+H)^2-Z1Z1-HH, but the latter is slower.
-            self.z *= &h;
-            self.z = self.z.double()?; // TODO replace with double_in_place after release of ark-ff > "0.4.2"
-        }
+        // X3 = r^2 + J - 2*V
+        self.x = r.square()?;
+        self.x += &j;
+        self.x -= &v.double()?;
+
+        // Y3 = r*(V-X3) + 2*Y1*J
+        v -= &self.x;
+
+        self.y = self.y.double()?; // TODO replace with double_in_place after release of ark-ff > "0.4.2"
+        self.y = sum_of_products::<P, F, 2>(&[r, self.y.clone()], &[v, j]);
+
+        // Z3 = 2 * Z1 * H;
+        // Can alternatively be computed as (Z1+H)^2-Z1Z1-HH, but the latter is slower.
+        self.z *= &h;
+        self.z = self.z.double()?; // TODO replace with double_in_place after release of ark-ff > "0.4.2"
 
         Ok(())
     }
@@ -226,6 +263,46 @@ where
         sum += a[i].clone() * b[i].clone();
     }
     sum
+}
+
+impl<P: SWCurveConfig, F: PrimeField> EqGadget<F> for NonNativeAffineVar<P, F>
+where
+    P::BaseField: PrimeField,
+{
+    fn is_eq(&self, other: &Self) -> Result<Boolean<F>, SynthesisError> {
+        let is_x_eq = self.x.is_eq(&other.x)?;
+        let is_y_eq = self.y.is_eq(&other.y)?;
+        is_x_eq.and(&is_y_eq)
+    }
+}
+
+impl<P: SWCurveConfig + Clone, F: PrimeField> CondSelectGadget<F> for NonNativeAffineVar<P, F>
+where
+    P::BaseField: PrimeField,
+{
+    fn conditionally_select(
+        cond: &Boolean<F>,
+        true_value: &Self,
+        false_value: &Self,
+    ) -> Result<Self, SynthesisError> {
+        let x = NonNativeFieldVar::<P::BaseField, F>::conditionally_select(
+            cond,
+            &true_value.x,
+            &false_value.x,
+        )?;
+        let y = NonNativeFieldVar::<P::BaseField, F>::conditionally_select(
+            cond,
+            &true_value.y,
+            &false_value.y,
+        )?;
+        let z = NonNativeFieldVar::<P::BaseField, F>::conditionally_select(
+            cond,
+            &true_value.z,
+            &false_value.z,
+        )?;
+
+        Ok(NonNativeAffineVar::<P, F>::new_inner(x, y, z))
+    }
 }
 
 #[cfg(test)]
@@ -254,6 +331,9 @@ mod test {
         let y_from_native = NonNativeFieldVar::<bls12_fq, Scalar>::new_witness(cs.clone(), || {
             Ok(g1_multiplied_native.y)
         })?;
+        let z_from_native = NonNativeFieldVar::<bls12_fq, Scalar>::new_witness(cs.clone(), || {
+            Ok(g1_multiplied_native.z)
+        })?;
 
         let g1_x =
             NonNativeFieldVar::<bls12_fq, Scalar>::new_witness(cs.clone(), || Ok(g1_generator.x))?;
@@ -262,10 +342,35 @@ mod test {
 
         let mut g1_generator_var = G1Var::new(g1_x, g1_y);
         let scalar_var = FpVar::new_witness(cs.clone(), || Ok(scalar))?;
-        g1_generator_var = g1_generator_var.mul(&scalar_var)?;
+
+        let bits = scalar_var.to_bits_le()?;
+        g1_generator_var.mul_internal(bits.iter().take(5).rev())?; // only 5 bits to speedup tests
 
         assert_eq!(g1_generator_var.x.value(), x_from_native.value());
         assert_eq!(g1_generator_var.y.value(), y_from_native.value());
+        assert_eq!(g1_generator_var.z.value(), z_from_native.value());
+
+        Ok(())
+    }
+
+    #[test]
+    fn add_two_equal_points() -> Result<(), Error> {
+        let cs = ConstraintSystem::<Scalar>::new_ref();
+        let g1_generator = G1Affine::generator();
+        let g1_x =
+            NonNativeFieldVar::<bls12_fq, Scalar>::new_witness(cs.clone(), || Ok(g1_generator.x))?;
+        let g1_y =
+            NonNativeFieldVar::<bls12_fq, Scalar>::new_witness(cs.clone(), || Ok(g1_generator.y))?;
+
+        let mut g1_var_1 = G1Var::new(g1_x, g1_y);
+        let mut g1_var_2 = g1_var_1.clone();
+
+        let add = g1_var_1.add_assign(g1_var_1.clone())?;
+        g1_var_2.double_in_place()?;
+
+        assert_eq!(g1_var_1.x.value(), g1_var_2.x.value());
+        assert_eq!(g1_var_1.y.value(), g1_var_2.y.value());
+        assert_eq!(g1_var_1.z.value(), g1_var_2.z.value());
 
         Ok(())
     }
@@ -274,6 +379,8 @@ mod test {
     fn multiply_non_native_affine_var_by_scalars() -> Result<(), Error> {
         multiply_by_scalar(1)?;
         multiply_by_scalar(2)?;
-        multiply_by_scalar(13)
+        multiply_by_scalar(13)?;
+        multiply_by_scalar(25)?;
+        Ok(())
     }
 }
