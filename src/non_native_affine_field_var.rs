@@ -57,24 +57,14 @@ where
         self.z.is_zero()
     }
 
-    pub fn mul(&mut self, scalar_var: &FpVar<F>) -> Result<(), SynthesisError> {
+    pub fn mul(&mut self, scalar_var: &FpVar<F>, num_bits: u32) -> Result<(), SynthesisError> {
         let bits = scalar_var.to_bits_le()?;
-        self.mul_internal(bits.iter().rev())
-    }
 
-    fn mul_internal<'a>(
-        &mut self,
-        bits_le_rev: impl Iterator<Item = &'a Boolean<F>>,
-    ) -> Result<(), SynthesisError> {
         let mut res = Self::zero();
         let temp = Self::new_inner(self.x.clone(), self.y.clone(), self.z.clone());
 
-        let mut first_positive_bit: Boolean<F> = Boolean::constant(false);
-        for bit in bits_le_rev {
+        for bit in bits.iter().take(num_bits as usize).rev() {
             res.double_in_place()?;
-            res = first_positive_bit.select(&res, &Self::zero())?;
-
-            first_positive_bit = first_positive_bit.or(bit)?;
             let mut res_clone = res.clone();
             res_clone.add_assign(temp.clone())?;
 
@@ -312,6 +302,7 @@ mod test {
     use anyhow::Error;
     use ark_bls12_381::{Bls12_381, Fq as bls12_fq, G1Affine, G1Projective};
     use ark_ec::AffineRepr;
+    use ark_ff::BigInteger;
     use ark_relations::r1cs::{
         ConstraintSynthesizer, ConstraintSystem, ConstraintSystemRef, OptimizationGoal,
         SynthesisError,
@@ -342,9 +333,7 @@ mod test {
 
         let mut g1_generator_var = G1Var::new(g1_x, g1_y);
         let scalar_var = FpVar::new_witness(cs.clone(), || Ok(scalar))?;
-
-        let bits = scalar_var.to_bits_le()?;
-        g1_generator_var.mul_internal(bits.iter().take(5).rev())?; // only 5 bits to speedup tests
+        g1_generator_var.mul(&scalar_var, scalar.into_bigint().num_bits());
 
         assert_eq!(g1_generator_var.x.value(), x_from_native.value());
         assert_eq!(g1_generator_var.y.value(), y_from_native.value());

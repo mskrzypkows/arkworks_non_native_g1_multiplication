@@ -6,6 +6,7 @@ mod test {
     use ark_bls12_381::{Bls12_381, Fq as bls12_fq, G1Affine, G1Projective};
     use ark_ec::models::bls12::Bls12;
     use ark_ec::AffineRepr;
+    use ark_ff::BigInteger;
     use ark_ff::PrimeField;
     use ark_groth16::{prepare_verifying_key, Groth16, ProvingKey};
     use ark_r1cs_std::{
@@ -25,6 +26,7 @@ mod test {
 
     impl<F: PrimeField> ConstraintSynthesizer<F> for PolyEvaluationCircuit<F> {
         fn generate_constraints(self, cs: ConstraintSystemRef<F>) -> Result<(), SynthesisError> {
+            let num_bits = self.scalar.into_bigint().num_bits();
             let scalar_var = FpVar::new_witness(cs.clone(), || Ok(self.scalar))?;
 
             let coeff_commit_x =
@@ -38,7 +40,7 @@ mod test {
                 NonNativeFieldVar::<bls12_fq, F>::new_constant(cs.clone(), self.g1_generator.y)?;
 
             let mut g1_generator_var = G1Var::new(g1_x, g1_y);
-            g1_generator_var.mul(&scalar_var)?;
+            g1_generator_var.mul(&scalar_var, num_bits)?;
 
             println!(
                 "x values equal: {:?}",
@@ -50,10 +52,11 @@ mod test {
             );
             println!(
                 "z values equal: {:?}",
-                g1_generator_var.z.value()? == self.commit.z
+                g1_generator_var.z.value() == Ok(self.commit.z)
             );
 
-            g1_generator_var.x.enforce_equal(&coeff_commit_x)?;
+            coeff_commit_x.enforce_equal(&g1_generator_var.x)?;
+            coeff_commit_y.enforce_equal(&g1_generator_var.y)?;
 
             Ok(())
         }
