@@ -6,6 +6,7 @@ mod test {
     use ark_bls12_381::{Bls12_381, Fq as bls12_fq, G1Affine, G1Projective};
     use ark_ec::models::bls12::Bls12;
     use ark_ec::AffineRepr;
+    use ark_ec::CurveGroup;
     use ark_ff::BigInteger;
     use ark_ff::PrimeField;
     use ark_groth16::{prepare_verifying_key, Groth16, ProvingKey};
@@ -19,14 +20,13 @@ mod test {
 
     #[derive(Clone)]
     struct PolyEvaluationCircuit<F: PrimeField> {
-        commit: G1Projective,
+        commit: G1Affine,
         g1_generator: G1Affine,
         scalar: F,
     }
 
     impl<F: PrimeField> ConstraintSynthesizer<F> for PolyEvaluationCircuit<F> {
         fn generate_constraints(self, cs: ConstraintSystemRef<F>) -> Result<(), SynthesisError> {
-            let num_bits = self.scalar.into_bigint().num_bits();
             let scalar_var = FpVar::new_witness(cs.clone(), || Ok(self.scalar))?;
 
             let coeff_commit_x =
@@ -40,7 +40,7 @@ mod test {
                 NonNativeFieldVar::<bls12_fq, F>::new_constant(cs.clone(), self.g1_generator.y)?;
 
             let mut g1_generator_var = G1Var::new(g1_x, g1_y);
-            g1_generator_var.mul(&scalar_var, num_bits)?;
+            g1_generator_var.mul(&scalar_var)?;
 
             println!(
                 "x values equal: {:?}",
@@ -50,10 +50,6 @@ mod test {
                 "y values equal: {:?}",
                 g1_generator_var.y.value() == coeff_commit_y.value()
             );
-            println!(
-                "z values equal: {:?}",
-                g1_generator_var.z.value() == Ok(self.commit.z)
-            );
 
             coeff_commit_x.enforce_equal(&g1_generator_var.x)?;
             coeff_commit_y.enforce_equal(&g1_generator_var.y)?;
@@ -62,12 +58,13 @@ mod test {
         }
     }
 
+    /// Warning: uses more than 10GB of memory
     #[test]
     fn verify_non_native_proof() -> Result<(), Error> {
         let rng = &mut rand::thread_rng();
         let scalar = Scalar::from(3);
         let g1_generator = G1Affine::generator();
-        let commit = g1_generator.mul(scalar);
+        let commit = g1_generator.mul(scalar).into_affine();
 
         let circuit = PolyEvaluationCircuit {
             commit: commit,
